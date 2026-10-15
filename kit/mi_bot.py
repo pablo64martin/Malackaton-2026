@@ -8,6 +8,13 @@ estrictas (aritmetica TODAS-derivables, unanimidad LLM+NLI) y reescalado.
 """
 
 import re
+import unicodedata
+
+# Normalizacion Unicode (idea del otro grupo): comparar sin tildes de forma
+# sistematica en vez de alternancias en cada regex.
+def _norm(s):
+    s = unicodedata.normalize("NFD", (s or "").lower())
+    return "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
 
 # Listas fusionadas: base propia + Pablo (aporta "nacional/del pais/cualquier"
 # para sobregeneralizacion, "permite/preve/supone/lleva a/hace que" para
@@ -63,6 +70,21 @@ def _norm_nums(s):
 
 def _toks(s):
     return re.findall(r"[a-záéíóúñü0-9]+", (s or "").lower())
+
+
+_PALABRAS_VACIAS = set(
+    "de la el en y a los las del un una que se por con para al lo su sus es "
+    "son fue como mas o no ha han sido este esta estos estas entre sobre "
+    "tras hasta desde sin ser le les ya".split()
+)
+
+
+def _palabras(s):
+    import unicodedata as _ud
+    s = _ud.normalize("NFD", (s or "").lower())
+    s = "".join(ch for ch in s if _ud.category(ch) != "Mn")
+    return {w[:5] for w in re.findall(r"[a-z0-9]+", s)
+            if w not in _PALABRAS_VACIAS and len(w) > 2 and not w.isdigit()}
 
 
 def _items_o(o, fuentes):
@@ -314,6 +336,7 @@ class Guardian:
                 for o in oraciones:
                     llm = o.get("llm") or {}
                     k = llm.get("fuente")
+                    por_k = list(o.get("respaldo_por_fuente") or [])
                     if not isinstance(k, int) or k < 0 or k >= len(fuentes):
                         continue
                     otxt = o.get("texto") or ""
@@ -356,6 +379,7 @@ class Guardian:
             # (atribucion y condicional viven en la ventana amplia 0.15 de arriba)
             # 3) entidades DESACTIVADO: precision medida 0.14 (20 TP / 121 FP).
             # El solape de nombres propios falla en parafrasis fieles.
+            # Atribucion top-restringida DESACTIVADA tras ablacion (no aporta).
             # 4) antonimos por oracion y su fuente top: contradiccion sin "no".
             # Global daba FP en textos contrastivos fieles (fuentes que hablan
             # de aumento Y reduccion para entidades distintas). Solo cuenta en
@@ -440,6 +464,12 @@ class Guardian:
                     deriv.add(round(100 - a - b, 2))
                     deriv.add(round(a * 100, 2))
                     deriv.add(round(a * 1000, 2))
+                    # producto, cociente y % (otro grupo: tasas y porcentajes)
+                    deriv.add(round(a * b, 2))
+                    if b:
+                        deriv.add(round(a / b, 2))
+                        deriv.add(round(100 * a / b, 2))
+                        deriv.add(round(100 * abs(a - b) / b, 2))
             nums_r = _NUM_RE.findall(rlow)
             missing = 0
             derived = 0
@@ -449,7 +479,9 @@ class Guardian:
                     continue
                 missing += 1
                 try:
-                    if round(float(nn), 2) in deriv:
+                    fv = float(nn)
+                    tol = max(0.051, 0.006 * abs(fv))
+                    if any(abs(fv - v) <= tol for v in deriv):
                         derived += 1
                 except Exception:
                     pass
@@ -485,6 +517,29 @@ class Guardian:
                 # TODAS las frases con >=0.95).
                 if not nums2 or all(n.replace(",", ".") in fflat2 for n in nums2):
                     base = max(0.0, base - 0.20)
+        except Exception:
+            pass
+
+        # Palabras nuevas como evidencia NEGATIVA (otro grupo): la parafrasis
+        # fiel comparte pocas palabras con la fuente; el anadido inventado
+        # suele ser 1-2 palabras. Mucha novedad + LLM unanime = parafrasis.
+        try:
+            pal_f = set()
+            for f in fuentes:
+                pal_f.update(_palabras(f))
+            pal_r = _palabras(respuesta)
+            if pal_r:
+                nov = len(pal_r - pal_f) / len(pal_r)
+                unanime = bool(oraciones) and all(
+                    (o.get("llm") or {}).get("veredicto") == "respaldada"
+                    for o in oraciones
+                )
+                contra_alta = any(
+                    (o.get("contradiccion_todas", 0) or 0) >= 0.40
+                    for o in oraciones
+                )
+                if nov > 0.5 and unanime and not contra_alta and not scope_hit:
+                    base = max(0.0, base - 0.15)
         except Exception:
             pass
 
