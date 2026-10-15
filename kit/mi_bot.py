@@ -1,16 +1,10 @@
-"""Mi bot para El Guardian. Solo Python estandar, sin modelos.
+"""Guardian coste-sensible (FN pesa 4x): NLI + LLM juez + chequeos lexicos.
 
-Estrategia:
-a) respaldo = max(mejor_fuente, respaldo_todas) -> no penalizar frases fieles
-   que combinan varias fuentes.
-b) el peor fragmento/oracion manda (max), no el promedio.
-c) contradiccion alta -> riesgo alto directo.
-d) LLM juez: si dice mal con confianza, creerle (precision alta); si dice
-   'respaldada' pero NLI no encuentra respaldo o confianza baja, desconfiar.
-e) heuristicas suaves solo cuando NLI ya sospecha (causas, universales,
-   cifra nueva) para no crear falsas alarmas.
-f) recalibracion al alza: FN pesa 4x y el corte oficial es 0.5, los scores
-   crudos salen bajos -> se reescalan para que el mejor corte caiga en 0.5.
+Solo Python estandar. score() devuelve P(alucinacion) en [0,1], calibrada para
+que el corte 0.5 sea el optimo con coste 4:1.
+Estrategia: riesgo continuo por oracion (LLM x0.55 + NLI x0.30 + gap x0.30),
+peor fragmento con tope, 2a evidencia lexica con abstencion, mitigaciones
+estrictas (aritmetica TODAS-derivables, unanimidad LLM+NLI) y reescalado.
 """
 
 import re
@@ -47,12 +41,6 @@ _CONDICIONAL = re.compile(
 )
 _DE_RE = re.compile(r"(\d+)\s+de\s+(los|las|\d+)", re.IGNORECASE)
 _NUM_RE = re.compile(r"\d+(?:[.,]\d+)*%?")
-_UNIT_RE = re.compile(
-    r"(\d+(?:[.,]\d+)?)\s*(millones?|miles?|millar\w*|p[aá]ginas?|documentos?|"
-    r"toneladas?|kilos?|euros?|c[eé]ntimos?|metros?|km|tiendas?|arboles?|árboles?|"
-    r"ejemplares?|a[ñn]os?|meses|d[íi]as?)",
-    re.IGNORECASE,
-)
 _PALABRA_NUM = {
     "cero": 0, "uno": 1, "dos": 2, "tres": 3, "cuatro": 4,
     "cinco": 5, "seis": 6, "siete": 7, "ocho": 8, "nueve": 9, "diez": 10,
@@ -83,15 +71,8 @@ def _solape(a, b, n=5):
     if not ta:
         return 0.0
     return len(ta & tb) / len(ta)
-# Palabras de numero complejo ("mil", "millon", "novecientos"...): el dict de
-# Pablo no las compone ("mil novecientos..." -> daria 70+8 sueltos y crearia
-# FP en la parafrasis fiel). Si aparecen, no se usa el chequeo de cifra nueva.
-_COMPLEJO_NUM = re.compile(
-    r"\bmil\b|\bmill[oó]n|\bciento|\bcientos|\bnovecientos|\bsetecientos|"
-    r"\bveint\w*|\btreinta y|\bcuarenta y|\bcincuenta y|\bsesenta y|"
-    r"\bsetenta y|\bochenta y|\bnoventa y",
-    re.IGNORECASE,
-)
+
+
 # Contradicciones sin "no": una cara en la respuesta y la otra en fuentes.
 _ANTONIMOS = [
     ("aument", "reduj"), ("aument", "disminuy"), ("aument", "cay"),
@@ -109,27 +90,6 @@ _ENDURECIDO = [
     ("costar", "presupuest"), ("es ", "podr"),
     ("confirm", "prev"), ("demostr", "sugier"),
 ]
-
-
-def _numeros(s):
-    return re.findall(r"\d+(?:[.,]\d+)?", s or "")
-
-
-def _norm_num(t):
-    return (t or "").replace(".", "").replace(",", "").replace(" ", "").replace("%", "")
-
-
-def _tokens_num(texto):
-    """Tokens numericos normalizados: digitos + palabras simples. % unido."""
-    toks = set()
-    for m in _NUM_RE.finditer(texto or ""):
-        t = _norm_num(m.group(0))
-        if t and t.isdigit():
-            toks.add(str(int(t)))
-    for w in re.findall(r"[a-záéíóúñü]+", (texto or "").lower()):
-        if w in _PALABRA_NUM:
-            toks.add(str(_PALABRA_NUM[w]))
-    return toks
 
 
 # Umbral bruto optimo medido en train para coste 4:1. Se reescala de forma
@@ -163,14 +123,14 @@ class Guardian:
         n_fuentes = len(fuentes)
         n_or = len(oraciones)
         if n_fuentes <= 2 and n_or <= 1:
-            nivel = 0  # facil tipo-e
-            gris, tope_fr, ajuste = 0.38, 0.30, -0.12
+            # facil tipo-e
+            _, tope_fr, ajuste = 0.0, 0.30, -0.12
         elif n_fuentes >= 7 or n_or >= 3:
-            nivel = 2  # dificil tipo-H/T/N (7-9 fuentes)
-            gris, tope_fr, ajuste = 0.58, 0.65, 0.08
+            # dificil tipo-H/T/N (7-9 fuentes)
+            _, tope_fr, ajuste = 0.0, 0.65, 0.08
         else:
-            nivel = 1  # medio s/G/R (3-6 fuentes)
-            gris, tope_fr, ajuste = 0.46, 0.40, -0.02
+            # medio s/G/R (3-6 fuentes)
+            _, tope_fr, ajuste = 0.0, 0.40, -0.02
 
         def riesgo_oracion(u):
             # Continuo ponderado (Marcos): sin escalones 0.15/0.52/0.65 que
@@ -209,7 +169,8 @@ class Guardian:
             return r
 
         def riesgo_fragmento(u):
-            # b) por tramos: el lineal daba 0.50 al fiel mediano (0.17).
+            # Por tramos con topes por tramo (el lineal daba 0.50 al fiel
+            # mediano 0.17; el continuo bajaba recall).
             por_f = u.get("respaldo_por_fuente") or []
             mejor = max(list(por_f) + [0.0])
             todas = u.get("respaldo_todas", 0.0) or 0.0
@@ -244,21 +205,6 @@ class Guardian:
             max_or = max(riesgos_or + [0.0])
             max_fr = max(riesgos_fr + [0.0])
             base = max(max_or, max_fr)
-        # Señal de maxima precision: el LLM dice mal (solo ~20 FP en train).
-        # Ella sola puede condenar; el resto necesita companera (puerta final).
-        llm_malo = any(
-            ((o.get("llm") or {}).get("veredicto") in ("contradicha", "no_respaldada"))
-            for o in oraciones
-        )
-        # Pico de contradiccion NLI (para la puerta de doble evidencia).
-        contra_pico = False
-        for u in list(oraciones) + list(fragmentos):
-            por_c = u.get("contradiccion_por_fuente") or []
-            mc = max(list(por_c) + [0.0])
-            tc = u.get("contradiccion_todas", 0.0) or 0.0
-            if tc > 0.65 or mc > 0.75:
-                contra_pico = True
-                break
 
         # e) 2a evidencia en dos ventanas: fuerte (0.20-0.65, alta precision:
         # similitud, atribucion, entidades, antonimos) y suave (0.35-0.65:
@@ -423,10 +369,11 @@ class Guardian:
             pass
 
         # Descuento por unanimidad (Marcos): todo LLM-respaldada con >=0.95,
-        # sin contradiccion relevante, sin restriccion caida y cifras exactas
-        # -> fiel casi seguro. Recorta FP en claras sin tocar FN.
+        # sin contradiccion relevante, CON NLI de acuerdo (min respaldo>=0.30),
+        # sin restriccion caida y cifras exactas -> fiel casi seguro.
         try:
             mit_ok = bool(oraciones) and not scope_hit
+            min_rt = 1.0
             for o in oraciones:
                 llm = o.get("llm") or {}
                 if llm.get("veredicto") != "respaldada" or (llm.get("confianza") or 0) < 0.95:
@@ -435,6 +382,11 @@ class Guardian:
                 if (o.get("contradiccion_todas", 0) or 0) >= 0.40:
                     mit_ok = False
                     break
+                rt = o.get("respaldo_todas", 0.0) or 0.0
+                if rt < min_rt:
+                    min_rt = rt
+            if min_rt < 0.30:
+                mit_ok = False
             if mit_ok:
                 nums2 = _NUM_RE.findall(_norm_nums(respuesta.lower()))
                 fflat2 = _norm_nums(texto_fuentes.lower()).replace(",", ".")
@@ -454,18 +406,4 @@ class Guardian:
         calibrado = _reescalar(bruto * 1.0 + ajuste)
         if bruto > 0.75:
             calibrado = max(calibrado, 0.85)
-        # Puerta final DESACTIVADA: las mitigaciones estrictas (aritmetica
-        # TODAS-derivables, unanimidad 0.95) ya recortan FP con precision;
-        # la puerta se comia recall de grises con 1 evidencia (FN x4).
-        if False and not llm_malo and calibrado < 0.55:
-            frag_muy_bajo = any(
-                len((fr.get("texto") or "").split()) > 2
-                and max(max(list(fr.get("respaldo_por_fuente") or [0.0]) + [0.0]),
-                        fr.get("respaldo_todas", 0.0) or 0.0) < 0.08
-                for fr in fragmentos
-            )
-            n_evid = (1 if max_or >= 0.50 else 0) + (1 if frag_muy_bajo else 0) \
-                + (1 if extra >= 0.10 else 0) + (1 if contra_pico else 0)
-            if n_evid < 2:
-                calibrado = min(calibrado, 0.49)
         return float(min(1.0, max(0.0, calibrado)))
