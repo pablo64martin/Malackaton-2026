@@ -65,6 +65,82 @@ def _toks(s):
     return re.findall(r"[a-záéíóúñü0-9]+", (s or "").lower())
 
 
+def _items_o(o, fuentes):
+    """Verifica item a item lo afirmado por la oracion. Devuelve
+    (fallos, total) o None si no hay nada verificable.
+    Pesos: numeros x2 (evidencia dura), resto x1."""
+    otxt = o.get("texto") or ""
+    if not fuentes or not otxt.strip():
+        return None
+    sims = list(o.get("similitud_por_fuente") or [])
+    if len(sims) == len(fuentes) and fuentes:
+        j = max(range(len(sims)), key=lambda i: sims[i])
+    else:
+        j = 0
+    best = fuentes[j]
+    nbest = _norm_nums(best.lower())
+    notxt = _norm_nums(otxt.lower())
+    alln = [_norm_nums(f.lower()) for f in fuentes]
+    fails, total = 0, 0
+
+    def _numkey(n):
+        n = n.replace(",", ".")
+        if "." in n:
+            return {n, n.replace(".", "")}
+        return {n, n}
+
+    # numeros: presencia + co-ocurrencia con entidades (caza atribuciones)
+    nums = set()
+    for m in _NUM_RE.finditer(notxt):
+        nums.update(_numkey(m.group(0)))
+    ents = set(re.findall(r"[A-ZÁÉÍÓÚ][a-záéíóú]+", otxt))
+    primero = (otxt.strip().split() or [""])[0].strip('",«»(')
+    ents.discard(primero)
+    for n in sorted(nums)[:12]:
+        total += 2
+        s_num = [f for f in alln if n in f]
+        if not s_num:
+            fails += 2
+            continue
+        # Co-ocurrencia por clausula (coma/y separan afirmaciones de fuentes
+        # distintas): solo las entidades cercanas al numero deben compartir
+        # fuente con el.
+        cerca = set()
+        for cl in re.split(r"[,;]|\sy\s", otxt):
+            if n in _norm_nums(cl.lower()):
+                cerca.update(re.findall(r"[A-ZÁÉÍÓÚ][a-záéíóú]+", cl))
+        cerca.discard(primero)
+        if cerca and not any(cerca & set(re.findall(r"[A-ZÁÉÍÓÚ][a-záéíóú]+", f)) for f in s_num):
+            fails += 2
+    # entidades sueltas: deben existir en alguna fuente
+    allents = set()
+    for f in alln:
+        allents.update(re.findall(r"[A-ZÁÉÍÓÚ][a-záéíóú]+", f))
+    for e in ents:
+        total += 1
+        if e not in allents:
+            fails += 1
+    # restricciones/matices: solo cuentan las de fuentes de las que la
+    # oracion habla (solape>=0.30); asi no penaliza combinar fuentes.
+    rel = [f for f in fuentes if _solape(notxt, _norm_nums(f.lower())) >= 0.30] or [best]
+    reln = "\n".join(_norm_nums(f.lower()) for f in rel)
+    for sfn in [_norm_nums(f.lower()) for f in rel]:
+        for mm in _CONDICIONAL.finditer(sfn):
+            total += 1
+            if mm.group(0).lower() not in notxt:
+                fails += 1
+    # universales/causas anadidas: deben estar en alguna fuente relatada
+    if _UNIVERSAL.search(otxt) and not _UNIVERSAL.search(reln):
+        total += 1
+        fails += 1
+    if _CAUSAL.search(otxt) and not _CAUSAL.search(reln):
+        total += 1
+        fails += 1
+    if total == 0:
+        return None
+    return (fails, total)
+
+
 def _solape(a, b, n=5):
     ta = {t for t in _toks(a) if len(t) >= n}
     tb = set(_toks(b))
@@ -94,7 +170,7 @@ _ENDURECIDO = [
 
 # Umbral bruto optimo medido en train para coste 4:1. Se reescala de forma
 # monotona para que el corte oficial 0.5 sea el optimo (no cambia el orden).
-UMBRAL_BRUTO = 0.33
+UMBRAL_BRUTO = 0.36
 
 
 def _reescalar(s):
@@ -166,6 +242,20 @@ class Guardian:
 
             gap = max(0.0, sim_max - respaldo)
             r = 0.30 * (1.0 - respaldo) + 0.55 * lr + 0.10 * contra + 0.30 * gap
+
+            # Verificacion por items: lo afirmado por la oracion contra sus
+            # fuentes. Puede RESCATAR (todo verificado + NLI bajo = parafrasis
+            # con fallo NLI) y CAZAR (items que fallan + NLI alto = crimen
+            # perfecto). Ninguna otra senal hace las dos cosas.
+            iv = _items_o(u, fuentes)
+            if iv is not None:
+                fails, total = iv
+                if total >= 2:
+                    fr = fails / total
+                    if fails == 0 and r < 0.65:
+                        r = min(r, 0.30)
+                    elif fr >= 0.5:
+                        r = max(r, 0.62)
             return r
 
         def riesgo_fragmento(u):
