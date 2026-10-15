@@ -14,6 +14,74 @@ NUMWORDS = {'cero': 0, 'uno': 1, 'dos': 2, 'tres': 3, 'cuatro': 4, 'cinco': 5, '
 PARAPH = {'ultimo': ('reciente', 'actual', 'vigente'), 'solo': ('unicamente',), 'maximo': ('como mucho', 'a lo sumo'), 'minimo': ('como minimo', 'al menos')}
 
 
+ENT_RE = re.compile(r'[A-ZÁÉÍÓÚÜ][a-záéíóúü]+|[A-ZÁÉÍÓÚÜ]{2,}|[A-ZÁÉÍÓÚÜ]\b')
+ENT_STOP = {'El', 'La', 'Los', 'Las', 'Un', 'Una', 'En', 'De', 'Del', 'Con', 'Por', 'Para', 'Según', 'Segun', 'Desde', 'Hasta', 'Entre', 'Como', 'Más', 'Mas', 'Este', 'Esta', 'Eso', 'Sus', 'Su', 'Al', 'Se'}
+
+
+def _entities_case(fuentes, respuesta):
+    vocab = set()
+    for text in fuentes + [respuesta]:
+        for sent in re.split(r'[.!?]', text):
+            s = sent.strip()
+            ms = list(ENT_RE.finditer(s))
+            for k, m in enumerate(ms):
+                w = m.group(0)
+                if w in ENT_STOP:
+                    continue
+                if k == 0 and m.start() < 3:
+                    continue
+                vocab.add(_norm(w))
+    return vocab
+
+
+def _attrib_hit(fuentes, respuesta, vocab):
+    rlow = _norm(respuesta)
+    fl = [_norm(f) for f in fuentes]
+    for sent in re.split(r'[.!?]', respuesta):
+        sents = sent.strip()
+        ctx = set()
+        for m in ENT_RE.finditer(sents):
+            w = m.group(0)
+            if w in ENT_STOP:
+                continue
+            if _norm(w) in vocab:
+                ctx.add(_norm(w))
+        if not ctx:
+            continue
+        for m in NUM_RE.finditer(_norm(sents)):
+            v = _numval(m.group(0))
+            if v is None:
+                continue
+            holders = []
+            for fo, f in zip(fuentes, fl):
+                vals = set()
+                for x in NUM_RE.finditer(f):
+                    vv = _numval(x.group(0))
+                    if vv is not None:
+                        vals.add(round(vv, 2))
+                if round(v, 2) in vals:
+                    holders.append(fo)
+            if not holders:
+                continue
+            ok = False
+            for h in holders:
+                he = set()
+                for mm in ENT_RE.finditer(h):
+                    w = mm.group(0)
+                    if w in ENT_STOP:
+                        continue
+                    if _norm(w) in vocab:
+                        he.add(_norm(w))
+                if ctx & he:
+                    ok = True
+                    break
+            if not ok:
+                return True
+    return False
+
+
+
+
 def _norm(s):
     out = s.lower()
     for a, b in (('á', 'a'), ('é', 'e'), ('í', 'i'), ('ó', 'o'), ('ú', 'u'), ('ü', 'u')):
@@ -282,6 +350,15 @@ class Guardian:
                         fired.append('para+')
                     break
 
+        # 6b) cifra atribuida a otra entidad
+        try:
+            if _attrib_hit(fuentes, respuesta, _entities_case(fuentes, respuesta)):
+                base += 0.45
+                if debug:
+                    fired.append('attr+')
+        except Exception:
+            pass
+
         # 7) mitigacion
         if scope_hit == 0.0 and not hedge_hit:
             mit_ok = True
@@ -314,7 +391,7 @@ class Guardian:
                         if debug:
                             fired.append('mit-')
 
-        lo, hi = -0.78, 2.00
+        lo, hi = -0.59, 2.00
         s = (base - lo) / (hi - lo)
         if s < 0:
             s = 0.0
