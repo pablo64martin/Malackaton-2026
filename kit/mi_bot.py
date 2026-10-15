@@ -30,16 +30,21 @@ _UNIVERSAL = re.compile(
     r"\bdel pa[ií]s\b|\bnacional\b|\ben todo\b|\ben toda\b",
     re.IGNORECASE,
 )
-# Del colega: matices condicionales que la respuesta no puede quitar
-# ("podria" -> "es", "mas de" -> "exacto", "salvo X" omitido...). Criterio:
-# quitar un matiz = alucinacion. Se compara fuente CITADA vs oracion.
+# De Marcos: restricciones de alcance (las suyas traen tiempo, calidad y
+# ordinales que faltaban: durante/desde, anos/meses/dias/horas/semanas,
+# frescos/refrigerados/bajura/altura, primeros/ultimos, minimo/maximo).
+# Se compara fuente CITADA vs oracion con numeros normalizados y puerta de
+# solape: solo cuenta si la oracion habla de esa fuente.
 _CONDICIONAL = re.compile(
     r"podr[ií]a|podr[ií]an|posible|posibles|siempre que|salvo|excepto|"
     r"s[oó]lo|[uú]nicamente|al menos|en caso de|si se aprueba|si llueve|"
     r"condici[oó]n|condicionado|m[aá]s de|menos de|alrededor de|"
-    r"aproximadamente|hasta|entre",
+    r"aproximadamente|hasta|entre|durante|desde|"
+    r"frescos?|refrigerad\w*|bajura|altura|primeros?|[uú]ltimos?|"
+    r"m[íi]nimo|m[aá]ximo|a[ñn]os?|meses|d[íi]as|horas|semanas?",
     re.IGNORECASE,
 )
+_DE_RE = re.compile(r"(\d+)\s+de\s+(los|las|\d+)", re.IGNORECASE)
 _NUM_RE = re.compile(r"\d+(?:[.,]\d+)*%?")
 _PALABRA_NUM = {
     "cero": 0, "uno": 1, "dos": 2, "tres": 3, "cuatro": 4,
@@ -49,7 +54,28 @@ _PALABRA_NUM = {
     "diecinueve": 19, "veinte": 20, "treinta": 30,
     "cuarenta": 40, "cincuenta": 50, "sesenta": 60, "setenta": 70,
     "ochenta": 80, "noventa": 90, "cien": 100, "ciento": 100,
+    "mil": 1000, "una": 1,
 }
+
+
+def _norm_nums(s):
+    """Minusculas con numeros en palabra -> digitos (para comparar alcance)."""
+    out = s or ""
+    for w, v in _PALABRA_NUM.items():
+        out = re.sub(r"\b" + w + r"\b", str(v), out)
+    return out
+
+
+def _toks(s):
+    return re.findall(r"[a-záéíóúñü0-9]+", (s or "").lower())
+
+
+def _solape(a, b, n=5):
+    ta = {t for t in _toks(a) if len(t) >= n}
+    tb = set(_toks(b))
+    if not ta:
+        return 0.0
+    return len(ta & tb) / len(ta)
 # Palabras de numero complejo ("mil", "millon", "novecientos"...): el dict de
 # Pablo no las compone ("mil novecientos..." -> daria 70+8 sueltos y crearia
 # FP en la parafrasis fiel). Si aparecen, no se usa el chequeo de cifra nueva.
@@ -101,7 +127,7 @@ def _tokens_num(texto):
 
 # Umbral bruto optimo medido en train para coste 4:1. Se reescala de forma
 # monotona para que el corte oficial 0.5 sea el optimo (no cambia el orden).
-UMBRAL_BRUTO = 0.43
+UMBRAL_BRUTO = 0.33
 
 
 def _reescalar(s):
@@ -231,11 +257,14 @@ class Guardian:
         # similitud, atribucion, entidades, antonimos) y suave (0.35-0.65:
         # causal, universal, cifra). Los FN bajos (0.20-0.30) ya son visibles.
         extra = 0.0
+        scope_hit = False
         # Ventana amplia (0.15) solo para las dos senales de maxima precision:
         # matiz condicional omitido y numero atribuido a otra fuente. Ambas
         # verifican la fuente citada, casi nunca disparan en fieles.
         if 0.15 <= base <= 0.65:
             # atribucion: el LLM cita fuente k pero el NLI solo respalda en
+            # j!=k -> numero de otro (A/B, tarifas, dosis).
+            # j!=k -> numero de otro (A/B, tarifas, dosis).
             # j!=k -> numero de otro (A/B, tarifas, dosis).
             try:
                 for o in oraciones:
@@ -252,9 +281,9 @@ class Guardian:
                         break
             except Exception:
                 pass
-            # DEL COLEGA: la fuente citada trae matiz condicional que la
-            # oracion omite ("podria"->"es", "mas de 150000"->"150000",
-            # "salvo X" omitido). Quitar un matiz = alucinacion.
+            # RESTRICCION caida (Marcos): la oracion habla de la fuente citada
+            # (solape>=0.30 con numeros normalizados) pero omite una
+            # restriccion suya; incluye partitivo "N de los/las/N".
             try:
                 for o in oraciones:
                     llm = o.get("llm") or {}
@@ -262,8 +291,23 @@ class Guardian:
                     if not isinstance(k, int) or k < 0 or k >= len(fuentes):
                         continue
                     otxt = o.get("texto") or ""
-                    if _CONDICIONAL.search(fuentes[k]) and not _CONDICIONAL.search(otxt):
+                    srcn = _norm_nums((fuentes[k] or "").lower())
+                    orcn = _norm_nums(otxt.lower())
+                    if _solape(orcn, srcn) < 0.30:
+                        continue
+                    miss = False
+                    for mm in _CONDICIONAL.finditer(srcn):
+                        if mm.group(0).lower() not in orcn:
+                            miss = True
+                            break
+                    if not miss and _DE_RE.search(srcn):
+                        ns = _NUM_RE.findall(srcn)
+                        nr = _NUM_RE.findall(orcn)
+                        if ns and not any(n in nr for n in ns):
+                            miss = True
+                    if miss:
                         extra = max(extra, 0.15)
+                        scope_hit = True
                         break
             except Exception:
                 pass
@@ -339,9 +383,21 @@ class Guardian:
                 pass
             # (condicional duplicado eliminado: vive en la ventana 0.15)
         if 0.35 <= base <= 0.65:
-            # causal solo si ausente en fuentes (si esta, es cita fiel).
+            # causal triple-puerta (Marcos): ausente en fuentes + NLI flojo en
+            # alguna oracion + LLM sin aval confiado. Solo asi suma.
             if _CAUSAL.search(respuesta) and not _CAUSAL.search(texto_fuentes):
-                extra = max(extra, 0.10)
+                min_rt = min(
+                    [o.get("respaldo_todas", 0.0) or 0.0 for o in oraciones] + [1.0]
+                )
+                conf_max = 0.0
+                for o in oraciones:
+                    llm = o.get("llm") or {}
+                    if llm.get("veredicto") == "respaldada":
+                        cf = llm.get("confianza") or 0
+                        if cf > conf_max:
+                            conf_max = cf
+                if min_rt < 0.5 and conf_max < 0.92:
+                    extra = max(extra, 0.10)
             # universal solo si no esta en fuentes (si esta, es fiel)
             if _UNIVERSAL.search(respuesta) and not _UNIVERSAL.search(texto_fuentes):
                 extra = max(extra, 0.10)
@@ -354,27 +410,69 @@ class Guardian:
                 if any(t not in toks_f for t in toks_r):
                     extra = max(extra, 0.08)
 
-        # aritmetica fiel: si la cifra es suma/doble/mitad exacta de cifras de
-        # fuentes, el NLI suele dar bajo y es FP -> se descuenta. Solo digitos
-        # puros (las palabras van por _tokens_num y los complejos se saltan).
+        # aritmetica derivada fiel (Marcos): conjunto rico (suma, resta,
+        # 100-a-b para porcentajes, x100, x1000) y condicion estricta: TODAS
+        # las cifras no literales deben ser derivables. Si no, no descuenta.
+        # Asi no perdona alucinaciones con una coincidencia casual.
         try:
-            nums_f = [_norm_num(n) for n in _numeros(texto_fuentes)]
-            vals_f = sorted({int(x) for x in nums_f if x.isdigit() and len(x) <= 6})
-            for n in _numeros(respuesta):
-                nn = _norm_num(n)
-                if not nn or not nn.isdigit() or len(nn) > 6 or nn in nums_f:
+            fflat = _norm_nums(texto_fuentes.lower()).replace(",", ".")
+            rlow = _norm_nums(respuesta.lower())
+            src_vals = []
+            for x in _NUM_RE.findall(fflat):
+                try:
+                    src_vals.append(float(x.replace(",", ".")))
+                except Exception:
+                    pass
+            deriv = {round(v, 2) for v in src_vals}
+            for i in range(min(len(src_vals), 12)):
+                for j in range(min(len(src_vals), 12)):
+                    if i == j:
+                        continue
+                    a, b = src_vals[i], src_vals[j]
+                    deriv.add(round(a + b, 2))
+                    deriv.add(round(abs(a - b), 2))
+                    deriv.add(round(100 - a - b, 2))
+                    deriv.add(round(a * 100, 2))
+                    deriv.add(round(a * 1000, 2))
+            nums_r = _NUM_RE.findall(rlow)
+            missing = 0
+            derived = 0
+            for n in nums_r:
+                nn = n.replace(",", ".")
+                if nn in fflat:
                     continue
-                v = int(nn)
-                ok = False
-                s = set(vals_f)
-                for a in vals_f[:40]:
-                    if (v - a) in s or v == 2 * a or (a == 2 * v):
-                        ok = True
-                        break
-                if ok:
-                    extra = min(extra, 0.0) - 0.0  # marca: no es cifra inventada
-                    base = max(0.0, base - 0.15)
+                missing += 1
+                try:
+                    if round(float(nn), 2) in deriv:
+                        derived += 1
+                except Exception:
+                    pass
+            if missing and derived == missing:
+                base = max(0.0, base - 0.20)
+        except Exception:
+            pass
+
+        # Descuento por unanimidad (Marcos): todo LLM-respaldada con >=0.95,
+        # sin contradiccion relevante, sin restriccion caida y cifras exactas
+        # -> fiel casi seguro. Recorta FP en claras sin tocar FN.
+        try:
+            mit_ok = bool(oraciones) and not scope_hit
+            for o in oraciones:
+                llm = o.get("llm") or {}
+                if llm.get("veredicto") != "respaldada" or (llm.get("confianza") or 0) < 0.95:
+                    mit_ok = False
                     break
+                if (o.get("contradiccion_todas", 0) or 0) >= 0.40:
+                    mit_ok = False
+                    break
+            if mit_ok:
+                nums2 = _NUM_RE.findall(_norm_nums(respuesta.lower()))
+                fflat2 = _norm_nums(texto_fuentes.lower()).replace(",", ".")
+                # Sin cifras: la unanimidad confiada + sin contradiccion ya
+                # basta (el texto fiel sin numeros rara vez engana al LLM en
+                # TODAS las frases con >=0.95).
+                if not nums2 or all(n.replace(",", ".") in fflat2 for n in nums2):
+                    base = max(0.0, base - 0.20)
         except Exception:
             pass
 
@@ -386,11 +484,10 @@ class Guardian:
         calibrado = _reescalar(bruto * 1.0 + ajuste)
         if bruto > 0.75:
             calibrado = max(calibrado, 0.85)
-        # Puerta final anti-sobreajuste (generaliza a casos privados): sin
-        # LLM-malo, una senal MEDIA sola no cruza el 0.5 (el ajuste +0.08 o un
-        # extra huesped convertian dudas en condenas). Las fuertes (>=0.60:
-        # NLI muy bajo, pico NLI, LLM-malo) si cruzan solas: el recall (x4).
-        if not llm_malo and calibrado < 0.60:
+        # Puerta final DESACTIVADA: las mitigaciones estrictas (aritmetica
+        # TODAS-derivables, unanimidad 0.95) ya recortan FP con precision;
+        # la puerta se comia recall de grises con 1 evidencia (FN x4).
+        if False and not llm_malo and calibrado < 0.55:
             frag_muy_bajo = any(
                 len((fr.get("texto") or "").split()) > 2
                 and max(max(list(fr.get("respaldo_por_fuente") or [0.0]) + [0.0]),
