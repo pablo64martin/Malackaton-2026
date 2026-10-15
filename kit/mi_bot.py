@@ -67,6 +67,15 @@ _ANTONIMOS = [
     ("todos", "algunos"), ("todas", "algunas"), ("siempre", "nunca"),
     ("todos", "varios"), ("todas", "varias"),
 ]
+# Endurecimiento verbal: la respuesta afirma fuerte lo que las fuentes solo
+# proponen/sugieren (criterio: endurecer un verbo = alucinacion). Pares
+# (fuerte_en_respuesta, debil_en_fuentes).
+_ENDURECIDO = [
+    ("aprob", "propus"), ("aprob", "plante"),
+    ("inmuniz", "vacun"), ("garantiz", "posib"),
+    ("costar", "presupuest"), ("es ", "podr"),
+    ("confirm", "prev"), ("demostr", "sugier"),
+]
 
 
 def _numeros(s):
@@ -186,14 +195,21 @@ class Guardian:
             max_or = max(riesgos_or + [0.0])
             max_fr = max(riesgos_fr + [0.0])
             base = max(max_or, max_fr)
-            # 1) doble evidencia: un fragmento solo no condena. Si ninguna
-            # oracion llega a 0.40 y el LLM no dice mal, se topa a 0.44 (fiel).
-            llm_malo = any(
-                ((o.get("llm") or {}).get("veredicto") in ("contradicha", "no_respaldada"))
-                for o in oraciones
-            )
-            if max_or < 0.40 and not llm_malo:
-                base = min(base, 0.44)
+        # Señal de maxima precision: el LLM dice mal (solo ~20 FP en train).
+        # Ella sola puede condenar; el resto necesita companera (puerta final).
+        llm_malo = any(
+            ((o.get("llm") or {}).get("veredicto") in ("contradicha", "no_respaldada"))
+            for o in oraciones
+        )
+        # Pico de contradiccion NLI (para la puerta de doble evidencia).
+        contra_pico = False
+        for u in list(oraciones) + list(fragmentos):
+            por_c = u.get("contradiccion_por_fuente") or []
+            mc = max(list(por_c) + [0.0])
+            tc = u.get("contradiccion_todas", 0.0) or 0.0
+            if tc > 0.65 or mc > 0.75:
+                contra_pico = True
+                break
 
         # e) 2a evidencia en dos ventanas: fuerte (0.20-0.65, alta precision:
         # similitud, atribucion, entidades, antonimos) y suave (0.35-0.65:
@@ -249,14 +265,40 @@ class Guardian:
                         break
             except Exception:
                 pass
-            # 4) antonimos: contradiccion sin "no" (aumento/reduccion...).
+            # 4) antonimos por oracion y su fuente top: contradiccion sin "no".
+            # Global daba FP en textos contrastivos fieles (fuentes que hablan
+            # de aumento Y reduccion para entidades distintas). Solo cuenta en
+            # base media-alta para no inventar desde fieles claros.
             try:
-                low_r = (respuesta or "").lower()
-                low_f = (texto_fuentes or "").lower()
-                for a, b in _ANTONIMOS:
-                    if a in low_r and b in low_f:
-                        extra = max(extra, 0.12)
-                        break
+                if base >= 0.30:
+                    for o in oraciones:
+                        otxt = (o.get("texto") or "").lower()
+                        por_f = list(o.get("respaldo_por_fuente") or [])
+                        j = max(range(len(por_f)), key=lambda i: por_f[i]) if por_f else -1
+                        fj = (fuentes[j] or "").lower() if 0 <= j < len(fuentes) else ""
+                        for a, b in _ANTONIMOS:
+                            if a in otxt and b in fj:
+                                extra = max(extra, 0.12)
+                                break
+                        if extra >= 0.12:
+                            break
+            except Exception:
+                pass
+            # 4b) endurecimiento verbal: la oracion afirma fuerte lo que su
+            # fuente top solo propone/sugiere (criterio escrito).
+            try:
+                if base >= 0.20:
+                    for o in oraciones:
+                        otxt = (o.get("texto") or "").lower()
+                        por_f = list(o.get("respaldo_por_fuente") or [])
+                        j = max(range(len(por_f)), key=lambda i: por_f[i]) if por_f else -1
+                        fj = (fuentes[j] or "").lower() if 0 <= j < len(fuentes) else ""
+                        for fuerte, debil in _ENDURECIDO:
+                            if fuerte in otxt and debil in fj and fuerte not in fj:
+                                extra = max(extra, 0.12)
+                                break
+                        if extra >= 0.12:
+                            break
             except Exception:
                 pass
             # 5) DEL COLEGA: la fuente citada trae matiz condicional que la
@@ -275,7 +317,8 @@ class Guardian:
             except Exception:
                 pass
         if 0.35 <= base <= 0.65:
-            if _CAUSAL.search(respuesta):
+            # causal solo si ausente en fuentes (si esta, es cita fiel).
+            if _CAUSAL.search(respuesta) and not _CAUSAL.search(texto_fuentes):
                 extra = max(extra, 0.10)
             # universal solo si no esta en fuentes (si esta, es fiel)
             if _UNIVERSAL.search(respuesta) and not _UNIVERSAL.search(texto_fuentes):
@@ -321,4 +364,19 @@ class Guardian:
         calibrado = bruto * 1.0 + ajuste
         if bruto > 0.75:
             calibrado = max(calibrado, 0.85)
+        # Puerta final anti-sobreajuste (generaliza a casos privados): sin
+        # LLM-malo, una senal MEDIA sola no cruza el 0.5 (el ajuste +0.08 o un
+        # extra huesped convertian dudas en condenas). Las fuertes (>=0.60:
+        # NLI muy bajo, pico NLI, LLM-malo) si cruzan solas: el recall (x4).
+        if not llm_malo and calibrado < 0.60:
+            frag_muy_bajo = any(
+                len((fr.get("texto") or "").split()) > 2
+                and max(max(list(fr.get("respaldo_por_fuente") or [0.0]) + [0.0]),
+                        fr.get("respaldo_todas", 0.0) or 0.0) < 0.08
+                for fr in fragmentos
+            )
+            n_evid = (1 if max_or >= 0.50 else 0) + (1 if frag_muy_bajo else 0) \
+                + (1 if extra >= 0.10 else 0) + (1 if contra_pico else 0)
+            if n_evid < 2:
+                calibrado = min(calibrado, 0.49)
         return float(min(1.0, max(0.0, calibrado)))
