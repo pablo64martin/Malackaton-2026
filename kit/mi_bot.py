@@ -173,39 +173,39 @@ class Guardian:
             gris, tope_fr, ajuste = 0.46, 0.40, -0.02
 
         def riesgo_oracion(u):
+            # Continuo ponderado (Marcos): sin escalones 0.15/0.52/0.65 que
+            # empataban cientos de casos. Domina el LLM (x0.55) con NLI (x0.30),
+            # gap similitud-respaldo = distorsion (x0.30) y contradiccion (x0.10).
             por_f = u.get("respaldo_por_fuente") or []
             mejor = max(list(por_f) + [0.0])
             todas = u.get("respaldo_todas", 0.0) or 0.0
             # a) no castigar combinacion de fuentes
             respaldo = mejor if mejor > todas else todas
+            sim_max = max(list(u.get("similitud_por_fuente") or [0.0]) + [0.0])
 
-            # d) LLM como puerta (precision ~95% cuando dice mal).
+            # d) riesgo LLM continuo: respaldada confiada + NLI ok pesa casi 0;
+            # respaldada con NLI bajo o poca confianza sube.
             llm = u.get("llm") or {}
             v = llm.get("veredicto")
             conf = llm.get("confianza", 0.0) or 0.0
-            if v in ("contradicha", "no_respaldada"):
-                r = 0.80 + 0.15 * conf if conf >= 0.5 else 0.60
+            if v == "contradicha":
+                lr = 1.0
+            elif v == "no_respaldada":
+                lr = 0.85
             elif v == "respaldada":
-                if respaldo >= 0.40:
-                    r = 0.15 + (1.0 - respaldo) * 0.4
-                elif respaldo >= 0.20:
-                    r = gris  # adaptativa: 0.38 facil / 0.46 medio / 0.58 dificil
-                else:
-                    # NLI muy bajo: en dificil cruza solo (recall x4); en
-                    # facil/medio necesita 2a evidencia (ahi FN~0 y el NLI
-                    # falla en parafrasis fieles).
-                    r = 0.65 if nivel == 2 else 0.52
+                lr = 0.72 - respaldo * 1.15 - max(0.0, conf - 0.90) * 1.0
+                lr = min(0.80, max(0.03, lr))
             else:
-                r = (1.0 - respaldo) * 0.7
+                lr = 0.50
 
-            # c) contradiccion en picos fuertes pero SIN condenar sola: el
-            # NLI-contradiccion tambien falla en fieles. Deja 0.60 y cuenta
-            # como evidencia en la puerta final (contra_pico).
+            # c) contradiccion como sumando, no como sentencia.
             por_c = u.get("contradiccion_por_fuente") or []
             max_c = max(list(por_c) + [0.0])
             todas_c = u.get("contradiccion_todas", 0.0) or 0.0
-            if (todas_c > 0.65 or max_c > 0.75) and r > 0.35:
-                r = max(r, 0.60)
+            contra = min(1.0, max(max_c, todas_c))
+
+            gap = max(0.0, sim_max - respaldo)
+            r = 0.30 * (1.0 - respaldo) + 0.55 * lr + 0.10 * contra + 0.30 * gap
             return r
 
         def riesgo_fragmento(u):
