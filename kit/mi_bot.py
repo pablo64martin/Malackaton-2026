@@ -99,6 +99,19 @@ def _tokens_num(texto):
     return toks
 
 
+# Umbral bruto optimo medido en train para coste 4:1. Se reescala de forma
+# monotona para que el corte oficial 0.5 sea el optimo (no cambia el orden).
+UMBRAL_BRUTO = 0.43
+
+
+def _reescalar(s):
+    t = UMBRAL_BRUTO
+    s = min(1.2, max(0.0, float(s)))
+    if s < t:
+        return (s / t) * 0.5 if t > 0 else 0.0
+    return 0.5 + ((s - t) / (1.2 - t)) * 0.5
+
+
 class Guardian:
     def score(self, caso) -> float:
         sen = caso.get("senales", {}) or {}
@@ -124,7 +137,7 @@ class Guardian:
             gris, tope_fr, ajuste = 0.58, 0.65, 0.08
         else:
             nivel = 1  # medio s/G/R (3-6 fuentes)
-            gris, tope_fr, ajuste = 0.50, 0.50, 0.0
+            gris, tope_fr, ajuste = 0.46, 0.40, -0.02
 
         def riesgo_oracion(u):
             por_f = u.get("respaldo_por_fuente") or []
@@ -143,20 +156,23 @@ class Guardian:
                 if respaldo >= 0.40:
                     r = 0.15 + (1.0 - respaldo) * 0.4
                 elif respaldo >= 0.20:
-                    r = gris  # adaptativa: 0.38 facil / 0.58 dificil
+                    r = gris  # adaptativa: 0.38 facil / 0.46 medio / 0.58 dificil
                 else:
-                    r = 0.65
+                    # NLI muy bajo: en dificil cruza solo (recall x4); en
+                    # facil/medio necesita 2a evidencia (ahi FN~0 y el NLI
+                    # falla en parafrasis fieles).
+                    r = 0.65 if nivel == 2 else 0.52
             else:
                 r = (1.0 - respaldo) * 0.7
 
-            # c) contradiccion solo en picos fuertes Y con sospecha previa: el
-            # NLI-contradiccion tambien falla en fieles (idea del colega:
-            # el exigia base>0.5). Evita que un pico aislado condene solo.
+            # c) contradiccion en picos fuertes pero SIN condenar sola: el
+            # NLI-contradiccion tambien falla en fieles. Deja 0.60 y cuenta
+            # como evidencia en la puerta final (contra_pico).
             por_c = u.get("contradiccion_por_fuente") or []
             max_c = max(list(por_c) + [0.0])
             todas_c = u.get("contradiccion_todas", 0.0) or 0.0
             if (todas_c > 0.65 or max_c > 0.75) and r > 0.35:
-                r = max(r, 0.85)
+                r = max(r, 0.60)
             return r
 
         def riesgo_fragmento(u):
@@ -215,19 +231,10 @@ class Guardian:
         # similitud, atribucion, entidades, antonimos) y suave (0.35-0.65:
         # causal, universal, cifra). Los FN bajos (0.20-0.30) ya son visibles.
         extra = 0.0
-        if 0.20 <= base <= 0.65:
-            # similitud alta + respaldo bajo = distorsion (comparte palabras
-            # pero no verdad); es lo que el conteo lexico da por bueno.
-            try:
-                for o in oraciones:
-                    sm = max(list(o.get("similitud_por_fuente") or [0.0]) + [0.0])
-                    por_f = o.get("respaldo_por_fuente") or []
-                    rm = max(list(por_f) + [0.0] + [o.get("respaldo_todas", 0.0) or 0.0])
-                    if sm > 0.75 and rm < 0.35:
-                        extra = max(extra, 0.12)
-                        break
-            except Exception:
-                pass
+        # Ventana amplia (0.15) solo para las dos senales de maxima precision:
+        # matiz condicional omitido y numero atribuido a otra fuente. Ambas
+        # verifican la fuente citada, casi nunca disparan en fieles.
+        if 0.15 <= base <= 0.65:
             # atribucion: el LLM cita fuente k pero el NLI solo respalda en
             # j!=k -> numero de otro (A/B, tarifas, dosis).
             try:
@@ -245,6 +252,35 @@ class Guardian:
                         break
             except Exception:
                 pass
+            # DEL COLEGA: la fuente citada trae matiz condicional que la
+            # oracion omite ("podria"->"es", "mas de 150000"->"150000",
+            # "salvo X" omitido). Quitar un matiz = alucinacion.
+            try:
+                for o in oraciones:
+                    llm = o.get("llm") or {}
+                    k = llm.get("fuente")
+                    if not isinstance(k, int) or k < 0 or k >= len(fuentes):
+                        continue
+                    otxt = o.get("texto") or ""
+                    if _CONDICIONAL.search(fuentes[k]) and not _CONDICIONAL.search(otxt):
+                        extra = max(extra, 0.15)
+                        break
+            except Exception:
+                pass
+        if 0.20 <= base <= 0.65:
+            # similitud alta + respaldo bajo = distorsion (comparte palabras
+            # pero no verdad); es lo que el conteo lexico da por bueno.
+            try:
+                for o in oraciones:
+                    sm = max(list(o.get("similitud_por_fuente") or [0.0]) + [0.0])
+                    por_f = o.get("respaldo_por_fuente") or []
+                    rm = max(list(por_f) + [0.0] + [o.get("respaldo_todas", 0.0) or 0.0])
+                    if sm > 0.75 and rm < 0.35:
+                        extra = max(extra, 0.12)
+                        break
+            except Exception:
+                pass
+            # (atribucion y condicional viven en la ventana amplia 0.15 de arriba)
             # 3) entidades: la cifra esta en la fuente j pero los nombres no
             # coinciden con la oracion -> dato de otro.
             try:
@@ -301,21 +337,7 @@ class Guardian:
                             break
             except Exception:
                 pass
-            # 5) DEL COLEGA: la fuente citada trae matiz condicional que la
-            # oracion omite ("podria"->"es", "mas de 150000"->"150000",
-            # "salvo X" omitido). Quitar un matiz = alucinacion.
-            try:
-                for o in oraciones:
-                    llm = o.get("llm") or {}
-                    k = llm.get("fuente")
-                    if not isinstance(k, int) or k < 0 or k >= len(fuentes):
-                        continue
-                    otxt = o.get("texto") or ""
-                    if _CONDICIONAL.search(fuentes[k]) and not _CONDICIONAL.search(otxt):
-                        extra = max(extra, 0.15)
-                        break
-            except Exception:
-                pass
+            # (condicional duplicado eliminado: vive en la ventana 0.15)
         if 0.35 <= base <= 0.65:
             # causal solo si ausente en fuentes (si esta, es cita fiel).
             if _CAUSAL.search(respuesta) and not _CAUSAL.search(texto_fuentes):
@@ -358,10 +380,10 @@ class Guardian:
 
         bruto = min(1.0, max(0.0, base + extra))
 
-        # f) ajuste adaptativo ya calculado arriba (facil -0.12, medio 0.0,
-        # dificil +0.08). Acerca cada tramo a su mejor corte (0.70 / 0.50 /
-        # 0.25) manteniendo el corte global 0.5.
-        calibrado = bruto * 1.0 + ajuste
+        # f) ajuste adaptativo por tramo + reescalado al corte optimo de train
+        # (UMBRAL_BRUTO): monotono, no cambia el orden. La puerta final trabaja
+        # ya en escala del corte oficial 0.5.
+        calibrado = _reescalar(bruto * 1.0 + ajuste)
         if bruto > 0.75:
             calibrado = max(calibrado, 0.85)
         # Puerta final anti-sobreajuste (generaliza a casos privados): sin
