@@ -262,25 +262,8 @@ class Guardian:
         # matiz condicional omitido y numero atribuido a otra fuente. Ambas
         # verifican la fuente citada, casi nunca disparan en fieles.
         if 0.15 <= base <= 0.65:
-            # atribucion: el LLM cita fuente k pero el NLI solo respalda en
-            # j!=k -> numero de otro (A/B, tarifas, dosis).
-            # j!=k -> numero de otro (A/B, tarifas, dosis).
-            # j!=k -> numero de otro (A/B, tarifas, dosis).
-            try:
-                for o in oraciones:
-                    llm = o.get("llm") or {}
-                    k = llm.get("fuente")
-                    if k is None or llm.get("veredicto") != "respaldada":
-                        continue
-                    por_f = list(o.get("respaldo_por_fuente") or [])
-                    if not por_f or k < 0 or k >= len(por_f):
-                        continue
-                    j = max(range(len(por_f)), key=lambda i: por_f[i])
-                    if j != k and por_f[k] < 0.30 and por_f[j] > 0.55:
-                        extra = max(extra, 0.12)
-                        break
-            except Exception:
-                pass
+            # atribucion DESACTIVADA: precision medida 0.15 (9 TP / 50 FP).
+            # El mismatch cita-vs-top es normal al combinar fuentes.
             # RESTRICCION caida (Marcos): la oracion habla de la fuente citada
             # (solape>=0.30 con numeros normalizados) pero omite una
             # restriccion suya; incluye partitivo "N de los/las/N".
@@ -325,26 +308,8 @@ class Guardian:
             except Exception:
                 pass
             # (atribucion y condicional viven en la ventana amplia 0.15 de arriba)
-            # 3) entidades: la cifra esta en la fuente j pero los nombres no
-            # coinciden con la oracion -> dato de otro.
-            try:
-                for o in oraciones:
-                    otxt = o.get("texto") or ""
-                    if not _tokens_num(otxt):
-                        continue
-                    por_f = list(o.get("respaldo_por_fuente") or [])
-                    if not por_f:
-                        continue
-                    j = max(range(len(por_f)), key=lambda i: por_f[i])
-                    if por_f[j] < 0.55 or j >= len(fuentes):
-                        continue
-                    ent_o = set(re.findall(r"[A-ZÁÉÍÓÚ][a-záéíóú]+", otxt))
-                    ent_f = set(re.findall(r"[A-ZÁÉÍÓÚ][a-záéíóú]+", fuentes[j]))
-                    if ent_o and ent_f and len(ent_o & ent_f) * 2 < len(ent_o):
-                        extra = max(extra, 0.12)
-                        break
-            except Exception:
-                pass
+            # 3) entidades DESACTIVADO: precision medida 0.14 (20 TP / 121 FP).
+            # El solape de nombres propios falla en parafrasis fieles.
             # 4) antonimos por oracion y su fuente top: contradiccion sin "no".
             # Global daba FP en textos contrastivos fieles (fuentes que hablan
             # de aumento Y reduccion para entidades distintas). Solo cuenta en
@@ -401,14 +366,9 @@ class Guardian:
             # universal solo si no esta en fuentes (si esta, es fiel)
             if _UNIVERSAL.search(respuesta) and not _UNIVERSAL.search(texto_fuentes):
                 extra = max(extra, 0.10)
-            # cifra nueva (digitos o palabra) + poco respaldo -> distorsion.
-            # Si hay numero complejo en palabra ("mil novecientos..."), se
-            # abstiene: el dict parcial daria FP en la parafrasis fiel.
-            if not _COMPLEJO_NUM.search(respuesta):
-                toks_f = _tokens_num(texto_fuentes)
-                toks_r = _tokens_num(respuesta)
-                if any(t not in toks_f for t in toks_r):
-                    extra = max(extra, 0.08)
+            # cifra nueva DESACTIVADA: precision medida 0.22 (45 TP / 159 FP),
+            # bajo azar. La distorsion numerica ya la cubre similitud-alta +
+            # respaldo-bajo con mucha mejor precision.
 
         # aritmetica derivada fiel (Marcos): conjunto rico (suma, resta,
         # 100-a-b para porcentajes, x100, x1000) y condicion estricta: TODAS
