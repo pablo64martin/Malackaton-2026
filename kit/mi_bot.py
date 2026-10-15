@@ -324,11 +324,6 @@ class Guardian:
             max_or = max(riesgos_or + [0.0])
             max_fr = max(riesgos_fr + [0.0])
             base = max(max_or, max_fr)
-            # Correccion por longitud (Bonferroni): mas oraciones = mas
-            # oportunidades de pico ruidoso. Los TP suelen estar altos (0.7+)
-            # y sobreviven; los FP de ruido medio (0.5-0.65) caen.
-            base = max(0.0, base - 0.025 * max(0, n_or - 1)
-                       - 0.004 * max(0, len(fragmentos) - 4))
 
         # e) 2a evidencia en dos ventanas: fuerte (0.20-0.65, alta precision:
         # similitud, atribucion, entidades, antonimos) y suave (0.35-0.65:
@@ -560,4 +555,10 @@ class Guardian:
         calibrado = _reescalar(bruto * 1.0 + ajuste)
         if bruto > 0.75:
             calibrado = max(calibrado, 0.85)
+        # Liston por unidad (Bonferroni): con n oraciones hay n oportunidades
+        # de pico ruidoso; cada unidad debe superarlo. En n=1 no cambia nada
+        # (train-H intacto); en respuestas largas filtra el ruido medio.
+        liston = 0.5 + 0.06 * max(0, n_or - 1)
+        if calibrado < liston:
+            calibrado = min(calibrado, 0.49)
         return float(min(1.0, max(0.0, calibrado)))
