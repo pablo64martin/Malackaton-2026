@@ -36,8 +36,9 @@ _UNIVERSAL = re.compile(
 # Se compara fuente CITADA vs oracion con numeros normalizados y puerta de
 # solape: solo cuenta si la oracion habla de esa fuente.
 _CONDICIONAL = re.compile(
-    r"podr[ií]a|podr[ií]an|posible|posibles|siempre que|salvo|excepto|"
-    r"s[oó]lo|[uú]nicamente|al menos|en caso de|si se aprueba|si llueve|"
+    r"podr[ií]a|podr[ií]an|puede(n)?|posible(mente)?|probable(mente)?|"
+    r"si se cumple|si llueve|siempre que|salvo|excepto|"
+    r"s[oó]lo|[uú]nicamente|al menos|en caso de|si se aprueba|"
     r"condici[oó]n|condicionado|m[aá]s de|menos de|alrededor de|"
     r"aproximadamente|hasta|entre|durante|desde|"
     r"frescos?|refrigerad\w*|bajura|altura|primeros?|[uú]ltimos?|"
@@ -46,6 +47,12 @@ _CONDICIONAL = re.compile(
 )
 _DE_RE = re.compile(r"(\d+)\s+de\s+(los|las|\d+)", re.IGNORECASE)
 _NUM_RE = re.compile(r"\d+(?:[.,]\d+)*%?")
+_UNIT_RE = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s*(millones?|miles?|millar\w*|p[aá]ginas?|documentos?|"
+    r"toneladas?|kilos?|euros?|c[eé]ntimos?|metros?|km|tiendas?|arboles?|árboles?|"
+    r"ejemplares?|a[ñn]os?|meses|d[íi]as?)",
+    re.IGNORECASE,
+)
 _PALABRA_NUM = {
     "cero": 0, "uno": 1, "dos": 2, "tres": 3, "cuatro": 4,
     "cinco": 5, "seis": 6, "siete": 7, "ocho": 8, "nueve": 9, "diez": 10,
@@ -294,6 +301,9 @@ class Guardian:
                         break
             except Exception:
                 pass
+            # (unidad cambiada: sin aporte medido en train; fuera)
+            # 7) CUENTA CASI DESACTIVADO: FP en redondeos fieles (12.4% -> 12%
+            # cae dentro del +-12% y es compresion legitima).
         if 0.20 <= base <= 0.65:
             # similitud alta + respaldo bajo = distorsion (comparte palabras
             # pero no verdad); es lo que el conteo lexico da por bueno.
