@@ -342,7 +342,7 @@ class Guardian:
                     otxt = o.get("texto") or ""
                     srcn = _norm_nums((fuentes[k] or "").lower())
                     orcn = _norm_nums(otxt.lower())
-                    if _solape(orcn, srcn) < 0.30:
+                    if _solape(orcn, srcn) < 0.40:
                         continue
                     miss = False
                     for mm in _CONDICIONAL.finditer(srcn):
@@ -371,7 +371,7 @@ class Guardian:
                     sm = max(list(o.get("similitud_por_fuente") or [0.0]) + [0.0])
                     por_f = o.get("respaldo_por_fuente") or []
                     rm = max(list(por_f) + [0.0] + [o.get("respaldo_todas", 0.0) or 0.0])
-                    if sm > 0.75 and rm < 0.35:
+                    if sm > 0.80 and rm < 0.30:
                         extra = max(extra, 0.12)
                         break
             except Exception:
@@ -538,7 +538,7 @@ class Guardian:
                     (o.get("contradiccion_todas", 0) or 0) >= 0.40
                     for o in oraciones
                 )
-                if nov > 0.5 and unanime and not contra_alta and not scope_hit:
+                if nov > 0.30 and unanime and not contra_alta and not scope_hit:
                     base = max(0.0, base - 0.15)
         except Exception:
             pass
