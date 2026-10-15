@@ -26,8 +26,18 @@ _CAUSAL = re.compile(
 )
 _UNIVERSAL = re.compile(
     r"\btodos\b|\btodas\b|\btodo el\b|\btoda la\b|\bcualquier\b|\bcualquiera\b|"
-    r"\bsiempre\b|\bnunca\b|\bjam[aá]s\b|\bning[uú]n\b|\bninguna\b|"
+    r"\bsiempre\b|\bnunca\b|\bjam[aá]s\b|\bning[uú]n\b|\bninguna\b|\bnadie\b|"
     r"\bdel pa[ií]s\b|\bnacional\b|\ben todo\b|\ben toda\b",
+    re.IGNORECASE,
+)
+# Del colega: matices condicionales que la respuesta no puede quitar
+# ("podria" -> "es", "mas de" -> "exacto", "salvo X" omitido...). Criterio:
+# quitar un matiz = alucinacion. Se compara fuente CITADA vs oracion.
+_CONDICIONAL = re.compile(
+    r"podr[ií]a|podr[ií]an|posible|posibles|siempre que|salvo|excepto|"
+    r"s[oó]lo|[uú]nicamente|al menos|en caso de|si se aprueba|si llueve|"
+    r"condici[oó]n|condicionado|m[aá]s de|menos de|alrededor de|"
+    r"aproximadamente|hasta|entre",
     re.IGNORECASE,
 )
 _NUM_RE = re.compile(r"\d+(?:[.,]\d+)*%?")
@@ -130,11 +140,13 @@ class Guardian:
             else:
                 r = (1.0 - respaldo) * 0.7
 
-            # c) contradiccion (solo picos fuertes en dificil)
+            # c) contradiccion solo en picos fuertes Y con sospecha previa: el
+            # NLI-contradiccion tambien falla en fieles (idea del colega:
+            # el exigia base>0.5). Evita que un pico aislado condene solo.
             por_c = u.get("contradiccion_por_fuente") or []
             max_c = max(list(por_c) + [0.0])
             todas_c = u.get("contradiccion_todas", 0.0) or 0.0
-            if todas_c > 0.65 or max_c > 0.75:
+            if (todas_c > 0.65 or max_c > 0.75) and r > 0.35:
                 r = max(r, 0.85)
             return r
 
@@ -244,6 +256,21 @@ class Guardian:
                 for a, b in _ANTONIMOS:
                     if a in low_r and b in low_f:
                         extra = max(extra, 0.12)
+                        break
+            except Exception:
+                pass
+            # 5) DEL COLEGA: la fuente citada trae matiz condicional que la
+            # oracion omite ("podria"->"es", "mas de 150000"->"150000",
+            # "salvo X" omitido). Quitar un matiz = alucinacion.
+            try:
+                for o in oraciones:
+                    llm = o.get("llm") or {}
+                    k = llm.get("fuente")
+                    if not isinstance(k, int) or k < 0 or k >= len(fuentes):
+                        continue
+                    otxt = o.get("texto") or ""
+                    if _CONDICIONAL.search(fuentes[k]) and not _CONDICIONAL.search(otxt):
+                        extra = max(extra, 0.15)
                         break
             except Exception:
                 pass
