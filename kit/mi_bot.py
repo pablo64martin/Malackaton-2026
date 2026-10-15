@@ -22,7 +22,8 @@ def _norm(s):
 _CAUSAL = re.compile(
     r"gracias a|debido a|a causa de|porque|por ello|por eso|con lo que|"
     r"hace que|lleva a|permite|prev[eé]|supone|esto permiti|esto provoc|"
-    r"esto gener|esto llev|esto hizo posible",
+    r"esto gener|esto llev|esto hizo posible|por consiguiente|por tanto|"
+    r"de modo que|as[ií] que",
     re.IGNORECASE,
 )
 _UNIVERSAL = re.compile(
@@ -111,22 +112,17 @@ def _items_o(o, fuentes):
             return {n, n.replace(".", "")}
         return {n, n}
 
-    # numeros: presencia + co-ocurrencia con entidades (caza atribuciones)
+    # numeros: presencia + co-ocurrencia con entidades de su clausula.
     nums = set()
+    primero = (otxt.strip().split() or [""])[0].strip('",«»(')
     for m in _NUM_RE.finditer(notxt):
         nums.update(_numkey(m.group(0)))
-    ents = set(re.findall(r"[A-ZÁÉÍÓÚ][a-záéíóú]+", otxt))
-    primero = (otxt.strip().split() or [""])[0].strip('",«»(')
-    ents.discard(primero)
     for n in sorted(nums)[:12]:
         total += 2
         s_num = [f for f in alln if n in f]
         if not s_num:
             fails += 2
             continue
-        # Co-ocurrencia por clausula (coma/y separan afirmaciones de fuentes
-        # distintas): solo las entidades cercanas al numero deben compartir
-        # fuente con el.
         cerca = set()
         for cl in re.split(r"[,;]|\sy\s", otxt):
             if n in _norm_nums(cl.lower()):
@@ -135,6 +131,8 @@ def _items_o(o, fuentes):
         if cerca and not any(cerca & set(re.findall(r"[A-ZÁÉÍÓÚ][a-záéíóú]+", f)) for f in s_num):
             fails += 2
     # entidades sueltas: deben existir en alguna fuente
+    ents = set(re.findall(r"[A-ZÁÉÍÓÚ][a-záéíóú]+", otxt))
+    ents.discard(primero)
     allents = set()
     for f in alln:
         allents.update(re.findall(r"[A-ZÁÉÍÓÚ][a-záéíóú]+", f))
@@ -178,6 +176,11 @@ _ANTONIMOS = [
     ("aprob", "propus"), ("aprob", "propuso"), ("inmuniz", "vacun"),
     ("todos", "algunos"), ("todas", "algunas"), ("siempre", "nunca"),
     ("todos", "varios"), ("todas", "varias"),
+    ("increment", "decrement"), ("increment", "reduj"), ("descens", "aument"),
+    ("mejor", "peor"), ("abrir", "cerrar"), ("apertur", "cierre"),
+    ("ganar", "perder"), ("gananc", "perdid"), ("contrat", "desped"),
+    ("obligatorio", "opcional"), ("prohibido", "permitido"),
+    ("mayoria", "minoria"), ("exito", "fracaso"), ("verdadero", "falso"),
 ]
 # Endurecimiento verbal: la respuesta afirma fuerte lo que las fuentes solo
 # proponen/sugieren (criterio: endurecer un verbo = alucinacion). Pares
@@ -187,6 +190,9 @@ _ENDURECIDO = [
     ("inmuniz", "vacun"), ("garantiz", "posib"),
     ("costar", "presupuest"), ("es ", "podr"),
     ("confirm", "prev"), ("demostr", "sugier"),
+    ("debe", "deberia"), ("debe", "podria"), ("tiene que", "puede"),
+    ("obligatorio", "recomend"), ("seguro", "probable"),
+    ("anunci", "rumor"), ("descubr", "investiga"),
 ]
 
 
@@ -263,7 +269,7 @@ class Guardian:
             contra = min(1.0, max(max_c, todas_c))
 
             gap = max(0.0, sim_max - respaldo)
-            r = 0.30 * (1.0 - respaldo) + 0.55 * lr + 0.10 * contra + 0.30 * gap
+            r = 0.28 * (1.0 - respaldo) + 0.55 * lr + 0.06 * contra + 0.25 * gap
 
             # Verificacion por items: lo afirmado por la oracion contra sus
             # fuentes. Puede RESCATAR (todo verificado + NLI bajo = parafrasis
@@ -300,7 +306,7 @@ class Guardian:
             todas_c = u.get("contradiccion_todas", 0.0) or 0.0
             if todas_c > 0.7 or max_c > 0.8:
                 r = max(r, 0.60)
-            if len((u.get("texto") or "").split()) <= 2:
+            if len((u.get("texto") or "").split()) <= 3:
                 r = min(r, 0.30)
             return r
 
@@ -308,8 +314,9 @@ class Guardian:
             riesgos_or.append(riesgo_oracion(o))
         for fr in fragmentos:
             rfr = riesgo_fragmento(fr)
-            # tope adaptativo: facil no condena solo, dificil si
-            riesgos_fr.append(min(rfr, tope_fr))
+            # Tope adaptativo: facil no condena solo, dificil si.
+            rfr = min(rfr, tope_fr)
+            riesgos_fr.append(rfr)
 
         if not riesgos_or and not riesgos_fr:
             base = 0.0
@@ -317,11 +324,17 @@ class Guardian:
             max_or = max(riesgos_or + [0.0])
             max_fr = max(riesgos_fr + [0.0])
             base = max(max_or, max_fr)
+            # Correccion por longitud (Bonferroni): mas oraciones = mas
+            # oportunidades de pico ruidoso. Los TP suelen estar altos (0.7+)
+            # y sobreviven; los FP de ruido medio (0.5-0.65) caen.
+            base = max(0.0, base - 0.025 * max(0, n_or - 1)
+                       - 0.004 * max(0, len(fragmentos) - 4))
 
         # e) 2a evidencia en dos ventanas: fuerte (0.20-0.65, alta precision:
         # similitud, atribucion, entidades, antonimos) y suave (0.35-0.65:
         # causal, universal, cifra). Los FN bajos (0.20-0.30) ya son visibles.
         extra = 0.0
+        n_extra = 0
         scope_hit = False
         # Ventana amplia (0.15) solo para las dos senales de maxima precision:
         # matiz condicional omitido y numero atribuido a otra fuente. Ambas
@@ -355,6 +368,7 @@ class Guardian:
                         if ns and not any(n in nr for n in ns):
                             miss = True
                     if miss:
+                        n_extra += 1
                         extra = max(extra, 0.15)
                         scope_hit = True
                         break
@@ -364,18 +378,8 @@ class Guardian:
             # 7) CUENTA CASI DESACTIVADO: FP en redondeos fieles (12.4% -> 12%
             # cae dentro del +-12% y es compresion legitima).
         if 0.20 <= base <= 0.65:
-            # similitud alta + respaldo bajo = distorsion (comparte palabras
-            # pero no verdad); es lo que el conteo lexico da por bueno.
-            try:
-                for o in oraciones:
-                    sm = max(list(o.get("similitud_por_fuente") or [0.0]) + [0.0])
-                    por_f = o.get("respaldo_por_fuente") or []
-                    rm = max(list(por_f) + [0.0] + [o.get("respaldo_todas", 0.0) or 0.0])
-                    if sm > 0.80 and rm < 0.30:
-                        extra = max(extra, 0.12)
-                        break
-            except Exception:
-                pass
+            # similitud: el gap ya vive en riesgo_oracion (0.30*gap); el extra
+            # aqui solo empujaba FP (medido 0 TP / 4 FP). Fuera.
             # (atribucion y condicional viven en la ventana amplia 0.15 de arriba)
             # 3) entidades DESACTIVADO: precision medida 0.14 (20 TP / 121 FP).
             # El solape de nombres propios falla en parafrasis fieles.
@@ -393,6 +397,7 @@ class Guardian:
                         fj = (fuentes[j] or "").lower() if 0 <= j < len(fuentes) else ""
                         for a, b in _ANTONIMOS:
                             if a in otxt and b in fj:
+                                n_extra += 1
                                 extra = max(extra, 0.12)
                                 break
                         if extra >= 0.12:
@@ -410,6 +415,7 @@ class Guardian:
                         fj = (fuentes[j] or "").lower() if 0 <= j < len(fuentes) else ""
                         for fuerte, debil in _ENDURECIDO:
                             if fuerte in otxt and debil in fj and fuerte not in fj:
+                                n_extra += 1
                                 extra = max(extra, 0.12)
                                 break
                         if extra >= 0.12:
@@ -422,7 +428,7 @@ class Guardian:
             # alguna oracion + LLM sin aval confiado. Solo asi suma.
             if _CAUSAL.search(respuesta) and not _CAUSAL.search(texto_fuentes):
                 min_rt = min(
-                    [o.get("respaldo_todas", 0.0) or 0.0 for o in oraciones] + [1.0]
+                    [max(max(o.get("respaldo_por_fuente") or [0.0]), o.get("respaldo_todas", 0.0) or 0.0) for o in oraciones] + [1.0]
                 )
                 conf_max = 0.0
                 for o in oraciones:
@@ -431,10 +437,12 @@ class Guardian:
                         cf = llm.get("confianza") or 0
                         if cf > conf_max:
                             conf_max = cf
-                if min_rt < 0.5 and conf_max < 0.92:
+                if min_rt < 0.6 and conf_max < 0.92:
+                    n_extra += 1
                     extra = max(extra, 0.10)
             # universal solo si no esta en fuentes (si esta, es fiel)
             if _UNIVERSAL.search(respuesta) and not _UNIVERSAL.search(texto_fuentes):
+                n_extra += 1
                 extra = max(extra, 0.10)
             # cifra nueva DESACTIVADA: precision medida 0.22 (45 TP / 159 FP),
             # bajo azar. La distorsion numerica ya la cubre similitud-alta +
@@ -486,7 +494,7 @@ class Guardian:
                 except Exception:
                     pass
             if missing and derived == missing:
-                base = max(0.0, base - 0.20)
+                base = max(0.0, base - 0.22)
         except Exception:
             pass
 
@@ -504,7 +512,8 @@ class Guardian:
                 if (o.get("contradiccion_todas", 0) or 0) >= 0.40:
                     mit_ok = False
                     break
-                rt = o.get("respaldo_todas", 0.0) or 0.0
+                pf = o.get("respaldo_por_fuente") or [0.0]
+                rt = max(max(pf), o.get("respaldo_todas", 0.0) or 0.0)
                 if rt < min_rt:
                     min_rt = rt
             if min_rt < 0.30:
@@ -543,7 +552,7 @@ class Guardian:
         except Exception:
             pass
 
-        bruto = min(1.0, max(0.0, base + extra))
+        bruto = min(1.0, max(0.0, base + extra + 0.02 * max(0, n_extra - 1)))
 
         # f) ajuste adaptativo por tramo + reescalado al corte optimo de train
         # (UMBRAL_BRUTO): monotono, no cambia el orden. La puerta final trabaja
