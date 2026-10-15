@@ -48,6 +48,14 @@ _CONDICIONAL = re.compile(
     re.IGNORECASE,
 )
 _DE_RE = re.compile(r"(\d+)\s+de\s+(los|las|\d+)", re.IGNORECASE)
+_MESES = ("enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|"
+          "setiembre|octubre|noviembre|diciembre")
+_FECHA_RE = re.compile(r"(\d{1,2})\s+de\s+(" + _MESES + r")(?:\s+de\s+(\d{4}))?")
+_PCT_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(%?)")
+_COMPAR_RE = re.compile(
+    r"\b(el|la|los|las|lo)\s+(m[aá]s|menos|mejor|peor|mayor|menor)\b",
+    re.IGNORECASE,
+)
 _NUM_RE = re.compile(r"\d+(?:[.,]\d+)*%?")
 _PALABRA_NUM = {
     "cero": 0, "uno": 1, "dos": 2, "tres": 3, "cuatro": 4,
@@ -170,6 +178,7 @@ def _solape(a, b, n=5):
 
 
 # Contradicciones sin "no": una cara en la respuesta y la otra en fuentes.
+# Lista amplia: direcciones, cantidad, tiempo relativo, calidad, modalidad.
 _ANTONIMOS = [
     ("aument", "reduj"), ("aument", "disminuy"), ("aument", "cay"),
     ("sube", "baja"), ("subi", "baj"), ("crec", "decrec"),
@@ -181,6 +190,22 @@ _ANTONIMOS = [
     ("ganar", "perder"), ("gananc", "perdid"), ("contrat", "desped"),
     ("obligatorio", "opcional"), ("prohibido", "permitido"),
     ("mayoria", "minoria"), ("exito", "fracaso"), ("verdadero", "falso"),
+    ("rapido", "lento"), ("veloz", "lento"), ("temprano", "tarde"),
+    ("pronto", "tarde"), ("caro", "barato"), ("grande", "pequeno"),
+    ("largo", "corto"), ("alto", "bajo"), ("ancho", "estrecho"),
+    ("fuerte", "debil"), ("duro", "blando"), ("claro", "oscuro"),
+    ("nuevo", "viejo"), ("joven", "anciano"), ("vivo", "muerto"),
+    ("encendido", "apagado"), ("lleno", "vacio"), ("limpio", "sucio"),
+    ("ordenado", "desordenado"), ("posible", "imposible"),
+    ("necesario", "innecesario"), ("suficiente", "insuficiente"),
+    ("correcto", "incorrecto"), ("verdadero", "erroneo"),
+    ("directo", "indirecto"), ("publico", "privado"),
+    ("externo", "interno"), ("superior", "inferior"),
+    ("maximo", "minimo"), ("primero", "ultimo"), ("inicio", "final"),
+    ("comienzo", "final"), ("entrada", "salida"), ("llegada", "partida"),
+    ("compra", "venta"), ("comprar", "vender"), ("alquilar", "vender"),
+    ("prestar", "pedir prestado"), ("enseñar", "aprender"),
+    ("recordar", "olvidar"), ("permitir", "prohibir"),
 ]
 # Endurecimiento verbal: la respuesta afirma fuerte lo que las fuentes solo
 # proponen/sugieren (criterio: endurecer un verbo = alucinacion). Pares
@@ -320,10 +345,12 @@ class Guardian:
 
         if not riesgos_or and not riesgos_fr:
             base = 0.0
+            i_or = -1
         else:
             max_or = max(riesgos_or + [0.0])
             max_fr = max(riesgos_fr + [0.0])
             base = max(max_or, max_fr)
+            i_or = max(range(len(riesgos_or)), key=lambda i: riesgos_or[i]) if riesgos_or else -1
 
         # e) 2a evidencia en dos ventanas: fuerte (0.20-0.65, alta precision:
         # similitud, atribucion, entidades, antonimos) y suave (0.35-0.65:
@@ -335,8 +362,6 @@ class Guardian:
         # matiz condicional omitido y numero atribuido a otra fuente. Ambas
         # verifican la fuente citada, casi nunca disparan en fieles.
         if 0.15 <= base <= 0.65:
-            # atribucion DESACTIVADA: precision medida 0.15 (9 TP / 50 FP).
-            # El mismatch cita-vs-top es normal al combinar fuentes.
             # RESTRICCION caida (Marcos): la oracion habla de la fuente citada
             # (solape>=0.30 con numeros normalizados) pero omite una
             # restriccion suya; incluye partitivo "N de los/las/N".
@@ -344,7 +369,6 @@ class Guardian:
                 for o in oraciones:
                     llm = o.get("llm") or {}
                     k = llm.get("fuente")
-                    por_k = list(o.get("respaldo_por_fuente") or [])
                     if not isinstance(k, int) or k < 0 or k >= len(fuentes):
                         continue
                     otxt = o.get("texto") or ""
@@ -369,16 +393,7 @@ class Guardian:
                         break
             except Exception:
                 pass
-            # (unidad cambiada: sin aporte medido en train; fuera)
-            # 7) CUENTA CASI DESACTIVADO: FP en redondeos fieles (12.4% -> 12%
-            # cae dentro del +-12% y es compresion legitima).
         if 0.20 <= base <= 0.65:
-            # similitud: el gap ya vive en riesgo_oracion (0.30*gap); el extra
-            # aqui solo empujaba FP (medido 0 TP / 4 FP). Fuera.
-            # (atribucion y condicional viven en la ventana amplia 0.15 de arriba)
-            # 3) entidades DESACTIVADO: precision medida 0.14 (20 TP / 121 FP).
-            # El solape de nombres propios falla en parafrasis fieles.
-            # Atribucion top-restringida DESACTIVADA tras ablacion (no aporta).
             # 4) antonimos por oracion y su fuente top: contradiccion sin "no".
             # Global daba FP en textos contrastivos fieles (fuentes que hablan
             # de aumento Y reduccion para entidades distintas). Solo cuenta en
@@ -386,10 +401,10 @@ class Guardian:
             try:
                 if base >= 0.30:
                     for o in oraciones:
-                        otxt = (o.get("texto") or "").lower()
+                        otxt = _norm(o.get("texto") or "")
                         por_f = list(o.get("respaldo_por_fuente") or [])
                         j = max(range(len(por_f)), key=lambda i: por_f[i]) if por_f else -1
-                        fj = (fuentes[j] or "").lower() if 0 <= j < len(fuentes) else ""
+                        fj = _norm(fuentes[j]) if 0 <= j < len(fuentes) else ""
                         for a, b in _ANTONIMOS:
                             if a in otxt and b in fj:
                                 n_extra += 1
@@ -404,10 +419,10 @@ class Guardian:
             try:
                 if base >= 0.20:
                     for o in oraciones:
-                        otxt = (o.get("texto") or "").lower()
+                        otxt = _norm(o.get("texto") or "")
                         por_f = list(o.get("respaldo_por_fuente") or [])
                         j = max(range(len(por_f)), key=lambda i: por_f[i]) if por_f else -1
-                        fj = (fuentes[j] or "").lower() if 0 <= j < len(fuentes) else ""
+                        fj = _norm(fuentes[j]) if 0 <= j < len(fuentes) else ""
                         for fuerte, debil in _ENDURECIDO:
                             if fuerte in otxt and debil in fj and fuerte not in fj:
                                 n_extra += 1
@@ -417,7 +432,28 @@ class Guardian:
                             break
             except Exception:
                 pass
-            # (condicional duplicado eliminado: vive en la ventana 0.15)
+            # 9) % ANADIDO/QUITADO: mismo numero con distinto flag de
+            # porcentaje (12 <-> 12% cambia el significado). Medido neutro en
+            # train; se conserva por precision (el flip es casi siempre error).
+            try:
+                if "por cient" not in respuesta.lower() and "por cient" not in texto_fuentes.lower():
+                    pr = {(m.group(1).replace(",", "."), bool(m.group(2))) for m in _PCT_RE.finditer(respuesta)}
+                    pf = {(m.group(1).replace(",", "."), bool(m.group(2))) for m in _PCT_RE.finditer(texto_fuentes)}
+                    fn = {n for n, _ in pf}
+                    if any(n in fn and (n, p) not in pf for n, p in pr):
+                        extra = max(extra, 0.12)
+            except Exception:
+                pass
+            # 10) CON/SIN invertido: "sin X" donde la fuente dice "con X".
+            # Medido neutro en train; se conserva por lo mismo.
+            try:
+                for mm in re.finditer(r"\bsin\s+([a-záéíóúñü]{5,})", respuesta.lower()):
+                    w = mm.group(1)
+                    if re.search(r"\bcon\s+" + re.escape(w), texto_fuentes.lower()):
+                        extra = max(extra, 0.12)
+                        break
+            except Exception:
+                pass
         if 0.35 <= base <= 0.65:
             # causal triple-puerta (Marcos): ausente en fuentes + NLI flojo en
             # alguna oracion + LLM sin aval confiado. Solo asi suma.
@@ -439,9 +475,10 @@ class Guardian:
             if _UNIVERSAL.search(respuesta) and not _UNIVERSAL.search(texto_fuentes):
                 n_extra += 1
                 extra = max(extra, 0.10)
-            # cifra nueva DESACTIVADA: precision medida 0.22 (45 TP / 159 FP),
-            # bajo azar. La distorsion numerica ya la cubre similitud-alta +
-            # respaldo-bajo con mucha mejor precision.
+            # comparativo nuevo ("el mas grande"): alcance ampliado
+            if _COMPAR_RE.search(respuesta) and not _COMPAR_RE.search(texto_fuentes):
+                n_extra += 1
+                extra = max(extra, 0.10)
 
         # aritmetica derivada fiel (Marcos): conjunto rico (suma, resta,
         # 100-a-b para porcentajes, x100, x1000) y condicion estricta: TODAS
@@ -467,7 +504,8 @@ class Guardian:
                     deriv.add(round(100 - a - b, 2))
                     deriv.add(round(a * 100, 2))
                     deriv.add(round(a * 1000, 2))
-                    # producto, cociente y % (otro grupo: tasas y porcentajes)
+                    # producto, cociente y % (otro grupo: tasas y porcentajes;
+                    # "cuatro de cada diez" = 40 % sale de 100*a/b)
                     deriv.add(round(a * b, 2))
                     if b:
                         deriv.add(round(a / b, 2))
